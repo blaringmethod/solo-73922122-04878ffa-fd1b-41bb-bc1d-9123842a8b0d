@@ -22,6 +22,11 @@
   .msg{margin-top:12px;padding:10px 12px;border-radius:6px;font-size:14px;white-space:pre-wrap;display:none}
   .msg.ok{display:block;background:#e6f6e8;border:1px solid #9ed3a7}
   .msg.err{display:block;background:#fdecea;border:1px solid #f2b8b0}
+  .msg.warn{display:block;background:#fff7e0;border:1px solid #ecd28a}
+  .totals{margin:6px 0}
+  .totals label{display:inline-block;margin:4px 12px 4px 0;font-size:14px}
+  .totals input{width:80px;padding:4px 6px;font-size:14px}
+  select{font-size:14px;padding:4px 6px;max-width:100%}
   .hidden{display:none}
   .hint{font-size:13px;color:#667}
 </style>
@@ -60,6 +65,21 @@
   <section id="pubSec" class="hidden">
     <h2>4. 已公开记录（不可撤销）</h2>
     <div id="pubs"></div>
+  </section>
+
+  <section id="reconSec" class="hidden">
+    <h2>5. 核对公开汇总（按分区 / 年龄组复核合计）</h2>
+    <p class="hint">填写覆盖所有分区、所有年龄组的两组复核检出合计（整数），并选择一条公开记录。
+      修订后的各格检出数仍须在 0~人数之间；在满足两组合计且<b>改动格数最少</b>的所有可行修订中，
+      标出每次都要改的格与仅部分修订会改的格，并给出所选公开合计的可行上下界。
+      历史公开总数仅作对照，不约束修订；核对为只读操作，不改动调查数据与公开记录。</p>
+    <div class="totals" id="dTotals"></div>
+    <div class="totals" id="aTotals"></div>
+    <div style="margin-top:8px">
+      公开记录：<select id="pubSel"></select>
+      <button onclick="doReconcile()" style="margin-left:12px">执行核对</button>
+    </div>
+    <div id="reconMsg" class="msg"></div>
   </section>
 </main>
 <script>
@@ -100,7 +120,7 @@ async function load(){
 function render(){
   const imported = state.imported;
   document.getElementById('importSec').classList.toggle('hidden', imported);
-  for(const id of ['gridSec','selSec','pubSec'])
+  for(const id of ['gridSec','selSec','pubSec','reconSec'])
     document.getElementById(id).classList.toggle('hidden', !imported);
   if(!imported) return;
 
@@ -120,6 +140,15 @@ function render(){
       + pubs.map(p => `<tr><td>${p.id}</td><td>${esc(p.districts.join('、'))}</td><td>${esc(p.age_groups.join('、'))}</td><td>${p.total}</td><td>${esc(p.created_at)}</td></tr>`).join('')
       + '</table>'
     : '<p class="hint">暂无公开记录</p>';
+
+  // 核对入口：分区/年龄组合计输入框 + 公开记录下拉
+  document.getElementById('dTotals').innerHTML = '<b>分区复核合计：</b>'
+    + state.districts.map(d => `<label>${esc(d)} <input type="number" min="0" step="1" class="dtot" data-key="${esc(d)}"></label>`).join('');
+  document.getElementById('aTotals').innerHTML = '<b>年龄组复核合计：</b>'
+    + state.age_groups.map(a => `<label>${esc(a)} <input type="number" min="0" step="1" class="atot" data-key="${esc(a)}"></label>`).join('');
+  document.getElementById('pubSel').innerHTML = pubs.length
+    ? pubs.map(p => `<option value="${p.id}">#${p.id}：${esc(p.districts.join('、'))} × ${esc(p.age_groups.join('、'))}，总数 ${p.total}</option>`).join('')
+    : '<option value="">（暂无公开记录，请先发布）</option>';
 }
 function selection(){
   return {
@@ -174,6 +203,52 @@ async function doPublish(){
     el.className = 'msg ok';
     el.textContent = `已发布 #${r.id}：检出总数 ${r.total}（${esc(r.created_at)}）`;
     await load();
+  }catch(e){ showErr(el, e); }
+}
+
+function readTotals(cls, label){
+  const out = {};
+  for(const e of document.querySelectorAll('.' + cls)){
+    const v = e.value.trim();
+    if(v === '' || !/^-?\d+$/.test(v)) throw `${label}「${e.dataset.key}」的合计须为整数`;
+    const n = parseInt(v, 10);
+    if(n < 0) throw `${label}「${e.dataset.key}」的合计须为非负整数`;
+    out[e.dataset.key] = n;
+  }
+  return out;
+}
+function fmtCells(cells){
+  return cells.map(c => `${c.district} / ${c.age_group}（原检出数 ${c.detected}，人数 ${c.population}）`).join('\n· ');
+}
+async function doReconcile(){
+  const el = document.getElementById('reconMsg');
+  let body;
+  try{
+    const pid = document.getElementById('pubSel').value;
+    if(!pid) throw '暂无公开记录可核对，请先在第 3 节发布。';
+    body = {
+      district_totals: readTotals('dtot', '分区'),
+      age_totals: readTotals('atot', '年龄组'),
+      publication_id: parseInt(pid, 10),
+    };
+  }catch(msg){ el.className = 'msg err'; el.textContent = String(msg); return; }
+  try{
+    const r = await api('/api/reconcile', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    const p = r.publication;
+    let t = `核对公开记录 #${p.id}（${p.districts.join('、')} × ${p.age_groups.join('、')}，原公开总数 ${p.total}）\n`;
+    if(!r.feasible){
+      el.className = 'msg err';
+      el.textContent = t + '结论：无法对账 —— 两组复核合计与 0~人数界限下不存在任何可行修订（如行列合计总和不一致或超出人数容量），请检查复核合计。';
+      return;
+    }
+    t += `满足两组合计的最少改动格数：${r.min_changes}\n`;
+    t += '每次都要改的格：' + (r.always_changed.length ? '\n· ' + fmtCells(r.always_changed) : '无') + '\n';
+    t += '仅部分修订会改的格：' + (r.sometimes_changed.length ? '\n· ' + fmtCells(r.sometimes_changed) : '无') + '\n';
+    t += `所选公开合计的可行上下界：[${r.bound_min}, ${r.bound_max}]；原总数 ${r.original_total} `
+       + (r.original_attainable ? '确实可取' : '不可取') + '\n';
+    t += `结论：${r.verdict}`;
+    el.className = 'msg ' + (r.verdict === '仍准确' ? 'ok' : r.verdict === '可能失准' ? 'warn' : 'err');
+    el.textContent = t;
   }catch(e){ showErr(el, e); }
 }
 load();

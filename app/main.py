@@ -9,6 +9,7 @@
 - GET  /api/admin/state 内部状态（含格内检出数）
 - POST /api/preview    预览交集检出总数并做安全评估
 - POST /api/publish    确认发布（按最新公开记录重核后原子写入）
+- POST /api/reconcile  按分区/年龄组复核合计核对一条公开汇总（只读，不改数据）
 - GET  /api/public     公开数据（人数 + 获准汇总）
 """
 
@@ -30,7 +31,7 @@ from .database import (
     insert_cells,
     insert_publication,
 )
-from .solver import evaluate
+from .solver import evaluate, reconcile
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -122,6 +123,14 @@ def parse_survey_csv(text: str) -> list[dict]:
 class Selection(BaseModel):
     districts: list[str] = Field(default_factory=list)
     age_groups: list[str] = Field(default_factory=list)
+
+
+class ReconcileRequest(BaseModel):
+    """核对请求：覆盖现有分区、年龄组的两组复核合计 + 所选公开记录 id。"""
+
+    district_totals: dict[str, int] = Field(default_factory=dict)
+    age_totals: dict[str, int] = Field(default_factory=dict)
+    publication_id: int
 
 
 # ---------------- 工具 ----------------
@@ -264,3 +273,44 @@ def public_data():
         ],
         "publications": get_publications(),
     }
+
+
+@app.post("/api/reconcile")
+async def reconcile_api(req: ReconcileRequest):
+    """核对一条公开汇总：只读操作，不改动调查数据与公开记录。
+
+    修订仅受"分区合计、年龄组合计 + 0~人数界限"约束；
+    历史公开总数仅作对照，不作为修订约束。
+    """
+    cells = get_cells()
+    if not cells:
+        raise HTTPException(400, "尚未导入调查数据")
+
+    known_d = {c["district"] for c in cells}
+    known_a = {c["age_group"] for c in cells}
+    if set(req.district_totals) != known_d:
+        missing = sorted(known_d - set(req.district_totals))
+        extra = sorted(set(req.district_totals) - known_d)
+        raise HTTPException(
+            400, f"分区合计须恰好覆盖现有分区；缺少：{missing}，未知：{extra}"
+        )
+    if set(req.age_totals) != known_a:
+        missing = sorted(known_a - set(req.age_totals))
+        extra = sorted(set(req.age_totals) - known_a)
+        raise HTTPException(
+            400, f"年龄组合计须恰好覆盖现有年龄组；缺少：{missing}，未知：{extra}"
+        )
+    for label, totals in (("分区", req.district_totals), ("年龄组", req.age_totals)):
+        for key, v in totals.items():
+            if v < 0:
+                raise HTTPException(400, f"{label}「{key}」的合计须为非负整数：{v}")
+
+    pub = next((p for p in get_publications() if p["id"] == req.publication_id), None)
+    if pub is None:
+        raise HTTPException(404, f"公开记录 #{req.publication_id} 不存在")
+
+    # 求解放入工作线程，求解期间公开页与其他请求不受影响。
+    result = await asyncio.to_thread(
+        reconcile, cells, req.district_totals, req.age_totals, pub
+    )
+    return {"publication": pub, **result}

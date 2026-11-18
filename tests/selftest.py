@@ -3,7 +3,7 @@
 运行：python tests/selftest.py
 覆盖：导入校验、导入后不可更换、预览、安全/不安全发布、
 两窗口各自安全但合并不安全的重核拒绝、公开页不泄露格内检出数、
-公开记录落盘持久化。
+公开记录落盘持久化、公开汇总核对（仍准确/确定失准/可能失准/无法对账）。
 """
 
 import os
@@ -198,6 +198,92 @@ def run():
             ),
             str(outs[:2]),
         )
+
+        # ---- 11. 公开汇总核对（独立库 + 2分区×3年龄组数据，端到端） ----
+        # 数据：城东 青年2/10 中年4/10 老年4/10（行和10）
+        #       城西 青年8/10 中年6/10 老年6/10（行和20）；列和均 10
+        dbmod.DB_PATH = str(Path(_TMP) / "recon.db")
+        dbmod.init_db()
+        SAMPLE3 = (
+            "分区,年龄组,人数,检出数\n"
+            "城东,青年,10,2\n"
+            "城东,中年,10,4\n"
+            "城东,老年,10,4\n"
+            "城西,青年,10,8\n"
+            "城西,中年,10,6\n"
+            "城西,老年,10,6\n"
+        )
+        r = import_csv(SAMPLE3)
+        check("核对用 2×3 数据导入成功", r.status_code == 201 and r.json()["imported"] == 6, r.text)
+        r = client.post("/api/publish", json={"districts": ["城东"], "age_groups": ["青年", "老年"]})
+        check("发布「城东×{青年,老年}」（总数=6）成功", r.status_code == 201 and r.json()["total"] == 6, r.text)
+        pub_id = r.json()["id"]
+
+        def recon(dt, at, pid=pub_id):
+            return client.post(
+                "/api/reconcile",
+                json={"district_totals": dt, "age_totals": at, "publication_id": pid},
+            )
+
+        # 11a. 请求校验
+        r = recon({"城东": 10}, {"青年": 10, "中年": 10, "老年": 10})
+        check("分区合计未覆盖所有分区被拒绝", r.status_code == 400, r.text)
+        r = recon({"城东": 10, "城西": 20, "城南": 1}, {"青年": 10, "中年": 10, "老年": 10})
+        check("未知分区被拒绝", r.status_code == 400, r.text)
+        r = recon({"城东": 10, "城西": 20}, {"青年": 10, "中年": 10})
+        check("年龄组合计未覆盖所有年龄组被拒绝", r.status_code == 400, r.text)
+        r = recon({"城东": -1, "城西": 20}, {"青年": 10, "中年": 10, "老年": 10})
+        check("负合计被拒绝", r.status_code == 400, r.text)
+        r = recon({"城东": 10, "城西": 20}, {"青年": 10, "中年": 10, "老年": 10}, pid=999)
+        check("不存在的公开记录被拒绝(404)", r.status_code == 404, r.text)
+
+        # 11b. 仍准确：复核合计与原数据一致 → 0 改动，公开总数被钉死
+        r = recon({"城东": 10, "城西": 20}, {"青年": 10, "中年": 10, "老年": 10})
+        j = r.json()
+        check("合计一致 → 仍准确",
+              r.status_code == 200 and j["feasible"] and j["min_changes"] == 0
+              and j["always_changed"] == [] and j["sometimes_changed"] == []
+              and j["bound_min"] == 6 and j["bound_max"] == 6
+              and j["original_attainable"] and j["verdict"] == "仍准确", r.text)
+
+        # 11c. 确定失准：城东+1、青年列+1 → 唯一必改格 城东/青年，公开和被钉死为 7
+        r = recon({"城东": 11, "城西": 20}, {"青年": 11, "中年": 10, "老年": 10})
+        j = r.json()
+        check("单格必改且公开总数不可取 → 确定失准",
+              r.status_code == 200 and j["feasible"] and j["min_changes"] == 1
+              and [(c["district"], c["age_group"]) for c in j["always_changed"]] == [("城东", "青年")]
+              and j["sometimes_changed"] == []
+              and j["bound_min"] == 7 and j["bound_max"] == 7
+              and not j["original_attainable"] and j["verdict"] == "确定失准", r.text)
+
+        # 11d. 可能失准：城东+1、城西-1、列和不变 → 最少改 2 格（同列一增一减），
+        #      公开交集和 ∈ [6,7]，原总数 6 仅部分修订可取
+        r = recon({"城东": 11, "城西": 19}, {"青年": 10, "中年": 10, "老年": 10})
+        j = r.json()
+        check("两格方案且公开总数仅部分修订保持 → 可能失准",
+              r.status_code == 200 and j["feasible"] and j["min_changes"] == 2
+              and j["always_changed"] == []
+              and len(j["sometimes_changed"]) == 6
+              and j["bound_min"] == 6 and j["bound_max"] == 7
+              and j["original_attainable"] and j["verdict"] == "可能失准", r.text)
+
+        # 11e. 无法对账：行列合计总和不一致
+        r = recon({"城东": 10, "城西": 20}, {"青年": 10, "中年": 10, "老年": 11})
+        j = r.json()
+        check("行列合计总和矛盾 → 无法对账",
+              r.status_code == 200 and not j["feasible"] and j["verdict"] == "无法对账", r.text)
+
+        # 11f. 核对为只读：调查数据与公开记录均未被改动
+        st = client.get("/api/admin/state").json()
+        check("核对后调查数据未变",
+              [(c["district"], c["age_group"], c["population"], c["detected"]) for c in st["cells"]]
+              == sorted([
+                  ("城东", "青年", 10, 2), ("城东", "中年", 10, 4), ("城东", "老年", 10, 4),
+                  ("城西", "青年", 10, 8), ("城西", "中年", 10, 6), ("城西", "老年", 10, 6),
+              ]), str(st["cells"]))
+        check("核对后公开记录未变",
+              len(st["publications"]) == 1 and st["publications"][0]["total"] == 6,
+              str(st["publications"]))
 
 
 run()
